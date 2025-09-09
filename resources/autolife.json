@@ -3,7 +3,7 @@
     "urdf": "autolife/autolife_spherized.urdf",
     "srdf": "autolife/autolife.srdf",
     "end_effector": "Link_Right_Gripper_Right_Finger",
-    "resolution": 128,
+    "resolution": 64,
     "template": "templates/fk_template.hh",
     "subtemplates": [{"name": "ccfk", "template": "templates/ccfk_template.hh"}],
     "output": "autolife_fk.hh"

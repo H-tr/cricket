@@ -390,10 +390,24 @@ struct RobotInfo
         }
 
         // Add remaining potential collisions
+        // Note: allowed_link_pairs stores frame indices, but GeometryModel pairs are in terms of
+        // geometry indices. Map frame pairs back to all geometry pairs that belong to those frames.
         collision_model.removeAllCollisionPairs();
         for (const auto &pair : allowed_link_pairs)
         {
-            collision_model.addCollisionPair(CollisionPair(pair.first, pair.second));
+            for (std::size_t gi = 0; gi < collision_model.ngeoms; ++gi)
+            {
+                const auto &geom_i = collision_model.geometryObjects[gi];
+                if (geom_i.parentFrame != pair.first) continue;
+
+                for (std::size_t gj = 0; gj < collision_model.ngeoms; ++gj)
+                {
+                    const auto &geom_j = collision_model.geometryObjects[gj];
+                    if (geom_j.parentFrame != pair.second) continue;
+
+                    collision_model.addCollisionPair(CollisionPair(gi, gj));
+                }
+            }
         }
     }
 
