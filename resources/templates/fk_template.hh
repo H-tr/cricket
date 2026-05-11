@@ -19,6 +19,8 @@ struct {{name}}
 
     static constexpr std::array<std::string_view, dimension> joint_names = {"{{join(joint_names, "\", \"")}}"};
     static constexpr char* end_effector = "{{end_effector}}";
+    static constexpr std::size_t n_end_effectors = {{n_end_effectors}};
+    static constexpr std::array<std::string_view, n_end_effectors> end_effectors = {"{{join(end_effectors, "\", \"")}}"};
 
     using Configuration = FloatVector<dimension>;
     using ConfigurationArray = std::array<FloatT, dimension>;
@@ -170,19 +172,25 @@ struct {{name}}
         return true;
     }
 
+    // Per-EE attachment collision check: one specialization per
+    // configured end-effector.  Each variant reuses the same body-vs-env
+    // and body-vs-body machinery (via the "ccfk" subtemplate) and adds
+    // an attachment-vs-env + attachment-vs-body pass anchored at its
+    // own EE pose.
+    {% for ee in per_ee %}
     template <std::size_t rake>
-    static inline bool fkcc_attach(
+    static inline bool fkcc_attach_{{ee.index}}(
         const vamp::collision::Environment<FloatVector<rake>> &environment,
         const ConfigurationBlock<rake> &x) noexcept
     {
-        std::array<FloatVector<rake, 1>, {{ccfkee_code_vars}}> v;
-        std::array<FloatVector<rake, 1>, {{ccfkee_code_output}}> y;
+        std::array<FloatVector<rake, 1>, {{ee.ccfkee_code_vars}}> v;
+        std::array<FloatVector<rake, 1>, {{ee.ccfkee_code_output}}> y;
 
-        {{ccfkee_code}}
+        {{ee.ccfkee_code}}
         {% include "ccfk" %}
 
-        // attaching at {{ end_effector }}
-        set_attachment_pose(environment, to_isometry(&y[{{ccfkee_code_output - 12}}]));
+        // attaching at {{ ee.name }}
+        set_attachment_pose(environment, to_isometry(&y[{{ee.ccfkee_code_output - 12}}]));
 
         //
         // attachment vs. environment collisions
@@ -196,8 +204,8 @@ struct {{name}}
         // attachment vs. robot collisions
         //
 
-        {% for i in range(length(end_effector_collisions)) %}
-        {% set link_index = at(end_effector_collisions, i) %}
+        {% for i in range(length(ee.end_effector_collisions)) %}
+        {% set link_index = at(ee.end_effector_collisions, i) %}
         {% set link_bs = at(bounding_sphere_index, link_index) %}
         {% set link_spheres = at(per_link_spheres, link_index) %}
 
@@ -224,15 +232,52 @@ struct {{name}}
 
         return true;
     }
+    {% endfor %}
+
+    // Runtime dispatch — VAMP's validator calls this; we route to the
+    // per-EE specialization keyed on the attached body's ee_index.
+    template <std::size_t rake>
+    static inline bool fkcc_attach(
+        const vamp::collision::Environment<FloatVector<rake>> &environment,
+        const ConfigurationBlock<rake> &x) noexcept
+    {
+        switch (environment.attachments->ee_index)
+        {
+            {% for ee in per_ee %}
+            case {{ee.index}}: return fkcc_attach_{{ee.index}}<rake>(environment, x);
+            {% endfor %}
+            default: return false;
+        }
+    }
+
+    // Per-EE forward kinematics.  ``eefk(x)`` (no index) is preserved as
+    // an alias for the first EE so existing callers stay source-compat.
+    {% for ee in per_ee %}
+    static inline auto eefk_{{ee.index}}(const std::array<float, {{n_q}}> &x) noexcept -> Eigen::Isometry3f
+    {
+        std::array<float, {{ee.eefk_code_vars}}> v;
+        std::array<float, {{ee.eefk_code_output}}> y;
+
+        {{ee.eefk_code}}
+
+        return to_isometry(y.data());
+    }
+    {% endfor %}
 
     static inline auto eefk(const std::array<float, {{n_q}}> &x) noexcept -> Eigen::Isometry3f
     {
-        std::array<float, {{eefk_code_vars}}> v;
-        std::array<float, {{eefk_code_output}}> y;
+        return eefk_0(x);
+    }
 
-        {{eefk_code}}
-
-        return to_isometry(y.data());
+    static inline auto eefk(std::size_t ee_index, const std::array<float, {{n_q}}> &x) noexcept -> Eigen::Isometry3f
+    {
+        switch (ee_index)
+        {
+            {% for ee in per_ee %}
+            case {{ee.index}}: return eefk_{{ee.index}}(x);
+            {% endfor %}
+            default: return Eigen::Isometry3f::Identity();
+        }
     }
 };
 }

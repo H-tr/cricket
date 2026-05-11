@@ -228,7 +228,12 @@ struct RobotInfo
 
     auto get_frames_colliding_end_effector() -> std::vector<std::size_t>
     {
-        std::size_t end_effector_joint = model.frames[end_effector_index].parentJoint;
+        return get_frames_colliding_link(end_effector_index);
+    }
+
+    auto get_frames_colliding_link(std::size_t link_frame_index) -> std::vector<std::size_t>
+    {
+        std::size_t end_effector_joint = model.frames[link_frame_index].parentJoint;
 
         std::vector<std::size_t> frames;
         for (auto i = 0U; i < model.frames.size(); ++i)
@@ -591,8 +596,10 @@ auto trace_sphere_cc_fk(
     const std::string &language,
     bool spheres = true,
     bool bounding_spheres = true,
-    bool fk = true) -> Traced
+    bool fk = true,
+    std::optional<std::size_t> ee_index_override = std::nullopt) -> Traced
 {
+    const std::size_t ee_index = ee_index_override.value_or(info.end_effector_index);
     auto nq = info.model.nq;
     auto vnq = info.virtual_nq();
     ADModel ad_model = info.model.cast<ADCG>();
@@ -659,7 +666,7 @@ auto trace_sphere_cc_fk(
 
     if (fk)
     {
-        trace_frame(info.end_effector_index, ad_data, data, n_spheres_data + n_bounding_spheres_data);
+        trace_frame(ee_index, ad_data, data, n_spheres_data + n_bounding_spheres_data);
     }
 
     // Create the AD function (independent vars are in virtual config space)
@@ -752,10 +759,32 @@ int main(int argc, char **argv)
         srdf_path = parent_path / data["srdf"];
     }
 
-    std::optional<std::string> end_effector_name = {};
-    if (data.contains("end_effector"))
+    // Collect end-effectors.  Accept either `"end_effector": "<link>"`
+    // (legacy single EE) or `"end_effectors": ["<linkA>", ...]` (list).
+    // The two forms are mutually exclusive.
+    std::vector<std::string> end_effector_names;
+    if (data.contains("end_effectors") and data.contains("end_effector"))
     {
-        end_effector_name = data["end_effector"];
+        throw std::runtime_error(
+            "Robot config has both `end_effector` and `end_effectors`; pick one.");
+    }
+    if (data.contains("end_effectors"))
+    {
+        end_effector_names = data["end_effectors"].get<std::vector<std::string>>();
+        if (end_effector_names.empty())
+        {
+            throw std::runtime_error("`end_effectors` list must not be empty.");
+        }
+    }
+    else if (data.contains("end_effector"))
+    {
+        end_effector_names.push_back(data["end_effector"].get<std::string>());
+    }
+
+    std::optional<std::string> primary_ee_name = {};
+    if (not end_effector_names.empty())
+    {
+        primary_ee_name = end_effector_names.front();
     }
 
     std::string language = "c++";
@@ -764,7 +793,7 @@ int main(int argc, char **argv)
         language = data["language"];
     }
 
-    RobotInfo robot(parent_path / data["urdf"], srdf_path, end_effector_name);
+    RobotInfo robot(parent_path / data["urdf"], srdf_path, primary_ee_name);
 
     if (data.contains("coupled_joints"))
     {
@@ -773,11 +802,7 @@ int main(int argc, char **argv)
 
     data.update(robot.json());
 
-    auto traced_eefk_code = trace_sphere_cc_fk(robot, language, false, false, true);
-    data["eefk_code"] = traced_eefk_code.code;
-    data["eefk_code_vars"] = traced_eefk_code.temp_variables;
-    data["eefk_code_output"] = traced_eefk_code.outputs;
-
+    // Body-only FK code blocks (independent of which EE is selected).
     auto traced_spherefk_code = trace_sphere_cc_fk(robot, language, true, false, false);
     data["spherefk_code"] = traced_spherefk_code.code;
     data["spherefk_code_vars"] = traced_spherefk_code.temp_variables;
@@ -788,10 +813,55 @@ int main(int argc, char **argv)
     data["ccfk_code_vars"] = traced_ccfk_code.temp_variables;
     data["ccfk_code_output"] = traced_ccfk_code.outputs;
 
-    auto traced_ccfkee_code = trace_sphere_cc_fk(robot, language, true, true, true);
-    data["ccfkee_code"] = traced_ccfkee_code.code;
-    data["ccfkee_code_vars"] = traced_ccfkee_code.temp_variables;
-    data["ccfkee_code_output"] = traced_ccfkee_code.outputs;
+    // Per-EE FK / attachment-check code blocks.  Always emitted as a list
+    // (even with one EE) so the template can drive everything off a uniform
+    // `per_ee` array.  Legacy top-level fields (eefk_code, ccfkee_code, …)
+    // are kept as the first EE's data so existing single-EE templates
+    // continue to compile unchanged.
+    nlohmann::json per_ee = nlohmann::json::array();
+    for (std::size_t i = 0; i < end_effector_names.size(); ++i)
+    {
+        const auto &name = end_effector_names[i];
+        if (not robot.model.existFrame(name))
+        {
+            throw std::runtime_error(fmt::format("Invalid EE name '{}'.", name));
+        }
+        const std::size_t ee_index = robot.model.getFrameId(name);
+
+        auto t_eefk =
+            trace_sphere_cc_fk(robot, language, false, false, true, ee_index);
+        auto t_ccfkee =
+            trace_sphere_cc_fk(robot, language, true, true, true, ee_index);
+
+        nlohmann::json entry;
+        entry["index"] = i;
+        entry["name"] = name;
+        entry["frame_index"] = ee_index;
+        entry["eefk_code"] = t_eefk.code;
+        entry["eefk_code_vars"] = t_eefk.temp_variables;
+        entry["eefk_code_output"] = t_eefk.outputs;
+        entry["ccfkee_code"] = t_ccfkee.code;
+        entry["ccfkee_code_vars"] = t_ccfkee.temp_variables;
+        entry["ccfkee_code_output"] = t_ccfkee.outputs;
+        entry["end_effector_collisions"] =
+            robot.get_frames_colliding_link(ee_index);
+        per_ee.push_back(entry);
+    }
+    data["per_ee"] = per_ee;
+    data["n_end_effectors"] = end_effector_names.size();
+    data["end_effectors"] = end_effector_names;
+
+    // Legacy aliases — first EE's data.  Templates that haven't been
+    // updated for multi-EE still work.
+    if (not per_ee.empty())
+    {
+        data["eefk_code"] = per_ee[0]["eefk_code"];
+        data["eefk_code_vars"] = per_ee[0]["eefk_code_vars"];
+        data["eefk_code_output"] = per_ee[0]["eefk_code_output"];
+        data["ccfkee_code"] = per_ee[0]["ccfkee_code"];
+        data["ccfkee_code_vars"] = per_ee[0]["ccfkee_code_vars"];
+        data["ccfkee_code_output"] = per_ee[0]["ccfkee_code_output"];
+    }
 
     inja::Environment env;
 
