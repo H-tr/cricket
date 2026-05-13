@@ -692,6 +692,199 @@ auto trace_sphere_cc_fk(
     return Traced{function_code.str(), handler.getTemporaryVariableCount(), n_out};
 }
 
+// Trace the fused forward-kinematics + Gaussian covariance propagation
+// for the probabilistic CC pipeline.
+//
+//   Input:   q (virtual config, vnq dims)  ⊕  vech(Σ_q) (n_sigma dims)
+//   Output:  per sphere — x, y, z, r, σ_xx, σ_xy, σ_xz, σ_yy, σ_yz, σ_zz
+//
+// Σ_q is symmetric over the `unc_cols` subset of virtual_q (e.g. the
+// planar base of a mobile manipulator: [0, 1, 2]).  The function emits
+// straight-line C++ for both the centre and the per-sphere covariance
+// ``Σ_r^s = J_s Σ_q J_s^T + r_s² · I``, where J_s = ∂c_s/∂(virtual_q on
+// the uncertain columns) is extracted symbolically from the FK tape
+// via ``ADFun::Jacobian``.  CppADCodeGen's CSE deduplicates the sin/cos
+// intermediates shared between centre and covariance outputs.
+auto trace_sphere_fk_with_cov(
+    const RobotInfo &info,
+    const std::string &language,
+    const std::vector<int> &unc_cols) -> Traced
+{
+    auto nq = info.model.nq;
+    auto vnq = info.virtual_nq();
+    const std::size_t n_unc = unc_cols.size();
+    const std::size_t n_sigma = n_unc * (n_unc + 1) / 2;  // upper triangle
+
+    if (info.spheres.empty())
+    {
+        throw std::runtime_error("trace_sphere_fk_with_cov: no spheres in robot");
+    }
+    for (auto c : unc_cols)
+    {
+        if (c < 0 or c >= static_cast<int>(vnq))
+        {
+            throw std::runtime_error(fmt::format(
+                "trace_sphere_fk_with_cov: uncertainty_columns entry {} out of range [0, {})",
+                c,
+                vnq));
+        }
+    }
+
+    ADModel ad_model = info.model.cast<ADCG>();
+    ADData ad_data(ad_model);
+
+    // Phase 1: trace the centres function f_c(virtual_q) → centres.
+    // This is the same FK trace as the deterministic path; the
+    // resulting ADFun's Jacobian is exactly J_s for every sphere.
+    ADVectorXs ad_virtual_q(vnq);
+    for (auto i = 0U; i < vnq; ++i)
+    {
+        ad_virtual_q[i] = ADCG(0.0);
+    }
+    Independent(ad_virtual_q);
+
+    // Apply joint coupling to lift virtual_q to full ad_q.
+    ADVectorXs ad_q(nq);
+    std::size_t vi = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(nq); ++i)
+    {
+        auto *coupling = info.find_slave_coupling(i);
+        if (coupling)
+        {
+            auto master_vi = info.full_to_virtual(coupling->master_q_idx);
+            ad_q[i] = ADCG(coupling->multiplier) * ad_virtual_q[master_vi]
+                       + ADCG(coupling->offset);
+        }
+        else
+        {
+            ad_q[i] = ad_virtual_q[vi++];
+        }
+    }
+
+    forwardKinematics(ad_model, ad_data, ad_q);
+    updateFramePlacements(ad_model, ad_data);
+
+    // 3 outputs per sphere (xyz only — radius is constant, folded in
+    // at compose time below).
+    const std::size_t n_centre_out = info.spheres.size() * 3;
+    ADVectorXs centre_data(n_centre_out);
+    for (auto i = 0U; i < info.spheres.size(); ++i)
+    {
+        const auto &sphere = info.spheres[i];
+        const auto &joint_placement = ad_data.oMi[sphere.parent_joint];
+
+        Eigen::Matrix<ADCG, 3, 1> local_translation;
+        local_translation[0] = sphere.relative.translation()[0];
+        local_translation[1] = sphere.relative.translation()[1];
+        local_translation[2] = sphere.relative.translation()[2];
+
+        Eigen::Matrix<ADCG, 3, 1> world_position =
+            joint_placement.rotation() * local_translation + joint_placement.translation();
+
+        centre_data[sphere.geom_index * 3 + 0] = world_position[0];
+        centre_data[sphere.geom_index * 3 + 1] = world_position[1];
+        centre_data[sphere.geom_index * 3 + 2] = world_position[2];
+    }
+
+    ADFun<CGD> centre_fn(ad_virtual_q, centre_data);
+
+    // Phase 2: build the combined symbolic computation in a fresh
+    // CodeHandler.  Inputs to the emitted C function are
+    // (virtual_q[0..vnq-1], sigma_q_upper[0..n_sigma-1]) in that order;
+    // outputs are (sphere_i.{x, y, z, r, σ_xx, σ_xy, σ_xz, σ_yy, σ_yz, σ_zz}).
+    CodeHandler<double> handler;
+    CppAD::vector<CGD> q_in(vnq);
+    handler.makeVariables(q_in);
+
+    CppAD::vector<CGD> sigma_q_in(n_sigma);
+    handler.makeVariables(sigma_q_in);
+
+    // Replay the FK tape on the CG inputs to get sphere centres.
+    CppAD::vector<CGD> centres = centre_fn.Forward(0, q_in);
+
+    // Replay it again, this time asking for the dense Jacobian
+    // ∂centre / ∂virtual_q.  Result is row-major: jac[(s*3 + xyz) * vnq + col].
+    CppAD::vector<CGD> jac = centre_fn.Jacobian(q_in);
+
+    // Build Σ_q matrix (n_unc × n_unc) from upper triangle.
+    Eigen::Matrix<CGD, Eigen::Dynamic, Eigen::Dynamic> Sigma_q(n_unc, n_unc);
+    {
+        std::size_t k = 0;
+        for (std::size_t i = 0; i < n_unc; ++i)
+        {
+            for (std::size_t j = i; j < n_unc; ++j)
+            {
+                Sigma_q(i, j) = sigma_q_in[k];
+                Sigma_q(j, i) = sigma_q_in[k];
+                ++k;
+            }
+        }
+    }
+
+    // Per sphere, emit 10 outputs: x y z r  σ_xx σ_xy σ_xz σ_yy σ_yz σ_zz.
+    const std::size_t n_out = info.spheres.size() * 10;
+    CppAD::vector<CGD> outputs(n_out);
+
+    for (std::size_t i = 0; i < info.spheres.size(); ++i)
+    {
+        const auto &sphere = info.spheres[i];
+        const std::size_t s = sphere.geom_index;
+        const std::size_t out_base = s * 10;
+
+        // Centre + radius.
+        outputs[out_base + 0] = centres[s * 3 + 0];
+        outputs[out_base + 1] = centres[s * 3 + 1];
+        outputs[out_base + 2] = centres[s * 3 + 2];
+        outputs[out_base + 3] = CGD(sphere.radius);
+
+        // Extract J_s ∈ R^{3 × n_unc} from the dense Jacobian.
+        Eigen::Matrix<CGD, 3, Eigen::Dynamic> J_s(3, n_unc);
+        for (std::size_t row = 0; row < 3; ++row)
+        {
+            for (std::size_t j = 0; j < n_unc; ++j)
+            {
+                J_s(row, j) = jac[(s * 3 + row) * vnq + unc_cols[j]];
+            }
+        }
+
+        // Σ_r^s = J_s Σ_q J_s^T + r_s² · I.  Symbolic; CppADCodeGen
+        // traces every scalar op and dedupes shared subexpressions
+        // (sin/cos of joint angles) against the centre outputs.
+        Eigen::Matrix<CGD, 3, 3> Sigma_rs = J_s * Sigma_q * J_s.transpose();
+        const auto r_sq = CGD(sphere.radius * sphere.radius);
+        Sigma_rs(0, 0) = Sigma_rs(0, 0) + r_sq;
+        Sigma_rs(1, 1) = Sigma_rs(1, 1) + r_sq;
+        Sigma_rs(2, 2) = Sigma_rs(2, 2) + r_sq;
+
+        outputs[out_base + 4] = Sigma_rs(0, 0);  // σ_xx
+        outputs[out_base + 5] = Sigma_rs(0, 1);  // σ_xy
+        outputs[out_base + 6] = Sigma_rs(0, 2);  // σ_xz
+        outputs[out_base + 7] = Sigma_rs(1, 1);  // σ_yy
+        outputs[out_base + 8] = Sigma_rs(1, 2);  // σ_yz
+        outputs[out_base + 9] = Sigma_rs(2, 2);  // σ_zz
+    }
+
+    LangCDefaultVariableNameGenerator<double> nameGen;
+    std::ostringstream function_code;
+
+    if (language == "c++")
+    {
+        LanguageCCustom<double> langC("double");
+        handler.generateCode(function_code, langC, outputs, nameGen);
+    }
+    else if (language == "rust")
+    {
+        LanguageRust<double> langRust("double");
+        handler.generateCode(function_code, langRust, outputs, nameGen);
+    }
+    else
+    {
+        throw std::runtime_error(fmt::format("unsupported language {}", language));
+    }
+
+    return Traced{function_code.str(), handler.getTemporaryVariableCount(), n_out};
+}
+
 int main(int argc, char **argv)
 {
     cxxopts::Options options(argv[0], "Tracing compiler for forward kinematics and collision checking");
@@ -792,6 +985,22 @@ int main(int argc, char **argv)
     data["ccfkee_code"] = traced_ccfkee_code.code;
     data["ccfkee_code_vars"] = traced_ccfkee_code.temp_variables;
     data["ccfkee_code_output"] = traced_ccfkee_code.outputs;
+
+    // Optional: emit the fused FK + Σ-propagation function when the
+    // config declares which virtual_q columns carry uncertainty.
+    if (data.contains("uncertainty_columns"))
+    {
+        const auto unc_cols = data["uncertainty_columns"].get<std::vector<int>>();
+        const std::size_t n_unc = unc_cols.size();
+        const std::size_t n_sigma = n_unc * (n_unc + 1) / 2;
+
+        auto traced_cov_code = trace_sphere_fk_with_cov(robot, language, unc_cols);
+        data["spherefk_with_cov_code"] = traced_cov_code.code;
+        data["spherefk_with_cov_code_vars"] = traced_cov_code.temp_variables;
+        data["spherefk_with_cov_code_output"] = traced_cov_code.outputs;
+        data["n_uncertainty_cols"] = n_unc;
+        data["n_sigma_q"] = n_sigma;
+    }
 
     inja::Environment env;
 

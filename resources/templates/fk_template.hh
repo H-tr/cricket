@@ -100,6 +100,82 @@ struct {{name}}
         }
     }
 
+{% if exists("spherefk_with_cov_code") %}
+    // Number of joint columns with Gaussian uncertainty, and the size
+    // of the upper-triangular Σ_q passed to ``sphere_fk_with_cov``.
+    static constexpr std::size_t n_uncertainty_cols = {{n_uncertainty_cols}};
+    static constexpr std::size_t n_sigma_q = {{n_sigma_q}};
+
+    // Per-sphere centre + symmetric 3×3 position covariance Σ_r^s in
+    // the SoA SIMD layout that mirrors ``Spheres<rake>``.  The Σ
+    // entries are the upper triangle row-major: σ_xx σ_xy σ_xz σ_yy σ_yz σ_zz.
+    template <std::size_t rake>
+    struct SpheresWithCov
+    {
+        FloatVector<rake, n_spheres> x;
+        FloatVector<rake, n_spheres> y;
+        FloatVector<rake, n_spheres> z;
+        FloatVector<rake, n_spheres> r;
+        FloatVector<rake, n_spheres> sigma_xx;
+        FloatVector<rake, n_spheres> sigma_xy;
+        FloatVector<rake, n_spheres> sigma_xz;
+        FloatVector<rake, n_spheres> sigma_yy;
+        FloatVector<rake, n_spheres> sigma_yz;
+        FloatVector<rake, n_spheres> sigma_zz;
+    };
+
+    // Fused FK + base-uncertainty propagation.  Output per sphere s:
+    //   (c_s ∈ R^3,  r_s,  Σ_r^s ∈ Sym3_+)
+    // where Σ_r^s = J_s · Σ_q · J_s^T + r_s² · I and J_s is the analytic
+    // Jacobian of c_s with respect to the configured uncertainty columns.
+    // The body kernel r_s² · I is folded in at codegen time.
+    //
+    // Inputs:
+    //   q_block       — rake-packed configurations (dimension joints per lane)
+    //   sigma_q_upper — rake-packed Σ_q upper triangle (n_sigma_q floats per
+    //                   lane; row-major).  Each lane may carry a distinct
+    //                   covariance, matching the per-waypoint Σ_b(τ_k) shape
+    //                   produced by an LQG-MP recursion.
+    template <std::size_t rake>
+    static inline void sphere_fk_with_cov(
+        const ConfigurationBlock<rake> &q_block,
+        const FloatVector<rake, n_sigma_q> &sigma_q_upper,
+        SpheresWithCov<rake> &out) noexcept
+    {
+        // The codegen-emitted body references inputs through a single
+        // flat ``x[i]`` array.  Lay out (q first, Σ_q after) into one
+        // backing array so the indices match what CppADCodeGen wrote.
+        std::array<FloatVector<rake, 1>, dimension + n_sigma_q> x;
+        for (auto i = 0U; i < dimension; ++i)
+        {
+            x[i] = q_block[i];
+        }
+        for (auto i = 0U; i < n_sigma_q; ++i)
+        {
+            x[dimension + i] = sigma_q_upper[i];
+        }
+
+        std::array<FloatVector<rake, 1>, {{spherefk_with_cov_code_vars}}> v;
+        std::array<FloatVector<rake, 1>, {{spherefk_with_cov_code_output}}> y;
+
+        {{spherefk_with_cov_code}}
+
+        for (auto i = 0U; i < {{n_spheres}}; ++i)
+        {
+            out.x[i]        = y[i * 10 + 0];
+            out.y[i]        = y[i * 10 + 1];
+            out.z[i]        = y[i * 10 + 2];
+            out.r[i]        = y[i * 10 + 3];
+            out.sigma_xx[i] = y[i * 10 + 4];
+            out.sigma_xy[i] = y[i * 10 + 5];
+            out.sigma_xz[i] = y[i * 10 + 6];
+            out.sigma_yy[i] = y[i * 10 + 7];
+            out.sigma_yz[i] = y[i * 10 + 8];
+            out.sigma_zz[i] = y[i * 10 + 9];
+        }
+    }
+{% endif %}
+
     using Debug = std::pair<std::vector<std::vector<std::string>>, std::vector<std::pair<std::size_t, std::size_t>>>;
 
     template <std::size_t rake>
